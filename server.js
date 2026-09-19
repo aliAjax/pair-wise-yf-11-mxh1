@@ -1,6 +1,7 @@
 const http = require("http");
 const { readFile, writeFile, mkdir } = require("fs/promises");
 const path = require("path");
+const loans = require("./loans");
 
 const PORT = Number(process.env.PORT || 3020);
 const DB_FILE = path.join(__dirname, "data", "db.json");
@@ -44,7 +45,8 @@ const initialData = {
       repairedAt: null
     }
   ],
-  batches: []
+  batches: [],
+  loans: []
 };
 
 const routes = [
@@ -58,7 +60,12 @@ const routes = [
   "GET /batches",
   "POST /batches",
   "GET /batches/:id",
-  "POST /batches/:id/complete"
+  "POST /batches/:id/complete",
+  "GET /loans?status=",
+  "POST /loans",
+  "GET /loans/:id",
+  "POST /loans/:id/return",
+  "POST /loans/:id/cancel"
 ];
 
 async function ensureDb() {
@@ -72,7 +79,9 @@ async function ensureDb() {
 
 async function readDb() {
   await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
+  const data = JSON.parse(await readFile(DB_FILE, "utf8"));
+  loans.ensureLoanStore(data);
+  return data;
 }
 
 async function writeDb(data) {
@@ -143,10 +152,13 @@ async function handle(req, res) {
   if (req.method === "GET" && pathname === "/rubbings") {
     const data = db.rubbings.map((rubbing) => {
       const damages = db.damages.filter((item) => item.rubbingId === rubbing.id);
+      const activeLoan = loans.activeLoanForRubbing(db, rubbing.id);
       return {
         ...rubbing,
         damageCount: damages.length,
-        pendingDamages: damages.filter((item) => item.status !== "repaired").length
+        pendingDamages: damages.filter((item) => item.status !== "repaired").length,
+        onLoan: Boolean(activeLoan),
+        activeLoanId: activeLoan ? activeLoan.id : null
       };
     });
     return send(res, 200, { data });
@@ -279,6 +291,54 @@ async function handle(req, res) {
     });
     await writeDb(db);
     return send(res, 200, { data: enrichBatch(db, batch) });
+  }
+
+  if (req.method === "GET" && pathname === "/loans") {
+    const status = url.searchParams.get("status");
+    const data = loans.listLoans(db, { status }).map((loan) => loans.enrichLoan(db, loan));
+    return send(res, 200, { data });
+  }
+
+  if (req.method === "POST" && pathname === "/loans") {
+    const body = await parseBody(req);
+    const payload = loans.validateLoanPayload(db, body);
+    const conflicts = loans.findLoanConflicts(db, payload);
+    if (conflicts.length) {
+      return send(res, 409, { error: "借展申请存在冲突，整单未保存", conflicts });
+    }
+    const loan = loans.createLoan(db, payload, makeId);
+    await writeDb(db);
+    return send(res, 201, { data: loans.enrichLoan(db, loan) });
+  }
+
+  const loanMatch = pathname.match(/^\/loans\/([^/]+)$/);
+  if (loanMatch && req.method === "GET") {
+    const loan = loans.findLoan(db, loanMatch[1]);
+    return send(res, 200, { data: loans.enrichLoan(db, loan) });
+  }
+
+  const loanReturnMatch = pathname.match(/^\/loans\/([^/]+)\/return$/);
+  if (loanReturnMatch && req.method === "POST") {
+    const loan = loans.findLoan(db, loanReturnMatch[1]);
+    const review = loans.reviewReturn(db, loan);
+    if (!review.ok) {
+      return send(res, 409, {
+        error: "仍有未修复缺损，归还复核未通过，借展单保持借出状态",
+        unrepaired: review.unrepaired,
+        data: loans.enrichLoan(db, loan)
+      });
+    }
+    loans.completeReturn(db, loan);
+    await writeDb(db);
+    return send(res, 200, { data: loans.enrichLoan(db, loan) });
+  }
+
+  const loanCancelMatch = pathname.match(/^\/loans\/([^/]+)\/cancel$/);
+  if (loanCancelMatch && req.method === "POST") {
+    const loan = loans.findLoan(db, loanCancelMatch[1]);
+    loans.cancelLoan(db, loan);
+    await writeDb(db);
+    return send(res, 200, { data: loans.enrichLoan(db, loan) });
   }
 
   return send(res, 404, { error: "接口不存在", routes });
