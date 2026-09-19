@@ -1,51 +1,10 @@
 const http = require("http");
-const { readFile, writeFile, mkdir } = require("fs/promises");
-const path = require("path");
+const { readDb, writeDb } = require("./lib/db");
+const loanStore = require("./lib/loanStore");
+const loanStatus = require("./lib/loanStatus");
+const loanService = require("./lib/loanService");
 
 const PORT = Number(process.env.PORT || 3020);
-const DB_FILE = path.join(__dirname, "data", "db.json");
-
-const initialData = {
-  rubbings: [
-    {
-      id: "rubbing_demo",
-      code: "TP-清-014",
-      source: "地方碑刻残页",
-      paperSize: "42x68cm",
-      note: "边缘有旧折痕",
-      createdAt: new Date().toISOString()
-    }
-  ],
-  damages: [
-    {
-      id: "damage_demo_1",
-      rubbingId: "rubbing_demo",
-      position: "左上角第3列题字旁",
-      type: "虫蛀孔",
-      beforePhotoUrl: "https://example.local/before-014-1.jpg",
-      afterPhotoUrl: "",
-      status: "pending",
-      repairNote: "",
-      batchId: null,
-      createdAt: new Date().toISOString(),
-      repairedAt: null
-    },
-    {
-      id: "damage_demo_2",
-      rubbingId: "rubbing_demo",
-      position: "下边缘中央",
-      type: "撕裂",
-      beforePhotoUrl: "https://example.local/before-014-2.jpg",
-      afterPhotoUrl: "",
-      status: "pending",
-      repairNote: "",
-      batchId: null,
-      createdAt: new Date().toISOString(),
-      repairedAt: null
-    }
-  ],
-  batches: []
-};
 
 const routes = [
   "GET /health",
@@ -58,26 +17,13 @@ const routes = [
   "GET /batches",
   "POST /batches",
   "GET /batches/:id",
-  "POST /batches/:id/complete"
+  "POST /batches/:id/complete",
+  "GET /loans",
+  "POST /loans",
+  "GET /loans/:id",
+  "POST /loans/:id/return",
+  "POST /loans/:id/cancel"
 ];
-
-async function ensureDb() {
-  await mkdir(path.dirname(DB_FILE), { recursive: true });
-  try {
-    JSON.parse(await readFile(DB_FILE, "utf8"));
-  } catch {
-    await writeFile(DB_FILE, JSON.stringify(initialData, null, 2));
-  }
-}
-
-async function readDb() {
-  await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
-}
-
-async function writeDb(data) {
-  await writeFile(DB_FILE, JSON.stringify(data, null, 2));
-}
 
 function send(res, status, body) {
   res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
@@ -144,7 +90,7 @@ async function handle(req, res) {
     const data = db.rubbings.map((rubbing) => {
       const damages = db.damages.filter((item) => item.rubbingId === rubbing.id);
       return {
-        ...rubbing,
+        ...loanStatus.decorateRubbing(db, rubbing),
         damageCount: damages.length,
         pendingDamages: damages.filter((item) => item.status !== "repaired").length
       };
@@ -180,6 +126,8 @@ async function handle(req, res) {
     findRubbing(db, rubbingId);
     const body = await parseBody(req);
     required(body, ["position", "type", "beforePhotoUrl"]);
+    // 状态联动：借展期内新增缺损进入归还复核
+    const loan = loanStatus.currentLoan(db, rubbingId);
     const damage = {
       id: makeId("damage"),
       rubbingId,
@@ -190,6 +138,8 @@ async function handle(req, res) {
       status: "pending",
       repairNote: "",
       batchId: null,
+      returnReview: Boolean(loan),
+      loanId: loan ? loan.id : null,
       createdAt: new Date().toISOString(),
       repairedAt: null
     };
@@ -281,11 +231,46 @@ async function handle(req, res) {
     return send(res, 200, { data: enrichBatch(db, batch) });
   }
 
+  if (req.method === "GET" && pathname === "/loans") {
+    return send(res, 200, { data: loanStore.listLoans(db).map((loan) => loanService.enrichLoan(db, loan)) });
+  }
+
+  if (req.method === "POST" && pathname === "/loans") {
+    const body = await parseBody(req);
+    // 冲突时 applyLoan 抛 409，writeDb 不会执行，整单不落盘
+    const loan = loanService.applyLoan(db, body, makeId);
+    await writeDb(db);
+    return send(res, 201, { data: loanService.enrichLoan(db, loan) });
+  }
+
+  const loanMatch = pathname.match(/^\/loans\/([^/]+)$/);
+  if (loanMatch && req.method === "GET") {
+    const loan = loanStore.findLoan(db, loanMatch[1]);
+    if (!loan) return send(res, 404, { error: "借展单不存在" });
+    return send(res, 200, { data: loanService.enrichLoan(db, loan) });
+  }
+
+  const loanReturnMatch = pathname.match(/^\/loans\/([^/]+)\/return$/);
+  if (loanReturnMatch && req.method === "POST") {
+    const loan = loanService.returnLoan(db, loanReturnMatch[1]);
+    await writeDb(db);
+    return send(res, 200, { data: loanService.enrichLoan(db, loan) });
+  }
+
+  const loanCancelMatch = pathname.match(/^\/loans\/([^/]+)\/cancel$/);
+  if (loanCancelMatch && req.method === "POST") {
+    const loan = loanService.cancelLoan(db, loanCancelMatch[1]);
+    await writeDb(db);
+    return send(res, 200, { data: loanService.enrichLoan(db, loan) });
+  }
+
   return send(res, 404, { error: "接口不存在", routes });
 }
 
 const server = http.createServer((req, res) => {
-  handle(req, res).catch((error) => send(res, error.status || 500, { error: error.message || "服务器错误" }));
+  handle(req, res).catch((error) =>
+    send(res, error.status || 500, { error: error.message || "服务器错误", ...(error.details || {}) })
+  );
 });
 
 server.listen(PORT, () => {
